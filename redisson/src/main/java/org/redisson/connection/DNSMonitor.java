@@ -34,28 +34,30 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * DNS changes monitor.
- * 
+ *
  * @author Nikita Koksharov
  *
  */
 public class DNSMonitor {
-    
+
     private static final Logger log = LoggerFactory.getLogger(DNSMonitor.class);
 
     private final AddressResolver<InetSocketAddress> resolver;
     private final ConnectionManager connectionManager;
     private final Map<RedisURI, InetSocketAddress> masters = new HashMap<>();
     private final Map<RedisURI, InetSocketAddress> slaves = new HashMap<>();
-    
+
     private ScheduledFuture<?> dnsMonitorFuture;
     private long dnsMonitoringInterval;
 
-    public DNSMonitor(ConnectionManager connectionManager, RedisClient masterHost, Collection<RedisURI> slaveHosts, long dnsMonitoringInterval, AddressResolverGroup<InetSocketAddress> resolverGroup) {
+    private int maxConcurrentDnsQuery;
+
+    public DNSMonitor(ConnectionManager connectionManager, RedisClient masterHost, Collection<RedisURI> slaveHosts, long dnsMonitoringInterval, AddressResolverGroup<InetSocketAddress> resolverGroup, int maxConcurrentDnsQuery) {
         this.resolver = resolverGroup.getResolver(connectionManager.getGroup().next());
-        
+
         masterHost.resolveAddr().join();
         masters.put(masterHost.getConfig().getAddress(), masterHost.getAddr());
-        
+
         for (RedisURI host : slaveHosts) {
             Future<InetSocketAddress> resolveFuture = resolver.resolve(InetSocketAddress.createUnresolved(host.getHost(), host.getPort()));
             resolveFuture.syncUninterruptibly();
@@ -63,19 +65,20 @@ public class DNSMonitor {
         }
         this.connectionManager = connectionManager;
         this.dnsMonitoringInterval = dnsMonitoringInterval;
+        this.maxConcurrentDnsQuery = maxConcurrentDnsQuery;
     }
-    
+
     public void start() {
         monitorDnsChange();
         log.debug("DNS monitoring enabled; Current masters: {}, slaves: {}", masters, slaves);
     }
-    
+
     public void stop() {
         if (dnsMonitorFuture != null) {
             dnsMonitorFuture.cancel(true);
         }
     }
-    
+
     private void monitorDnsChange() {
         dnsMonitorFuture = connectionManager.getGroup().schedule(() -> {
             if (connectionManager.isShuttingDown()) {
@@ -137,6 +140,36 @@ public class DNSMonitor {
     }
 
     private CompletableFuture<Void> monitorSlaves() {
+        return monitorSlaves(partitionMap(slaves), 0);
+    }
+
+    private CompletableFuture<Void> monitorSlaves(List<Map<RedisURI, InetSocketAddress>> list, int index) {
+        CompletableFuture<Void> future = monitorSlavesPartial(list.get(index));
+        if (index < list.size() - 1) {
+            future = future.whenComplete((c, a) -> monitorSlavesPartial(list.get(index + 1)));
+        }
+        return future;
+    }
+
+    private List<Map<RedisURI, InetSocketAddress>> partitionMap(Map<RedisURI, InetSocketAddress> map) {
+        List<Map<RedisURI, InetSocketAddress>> list = new ArrayList<>();
+        if (maxConcurrentDnsQuery == 0 || map.size() <= maxConcurrentDnsQuery) {
+            list.add(map);
+        } else {
+            int i = 0;
+            for (Map.Entry<RedisURI, InetSocketAddress> entry : map.entrySet()) {
+                int index = i / maxConcurrentDnsQuery;
+                if (i % maxConcurrentDnsQuery == 0) {
+                    list.add(new HashMap<>());
+                }
+                list.get(index).put(entry.getKey(), entry.getValue());
+                i++;
+            }
+        }
+        return list;
+    }
+
+    private CompletableFuture<Void> monitorSlavesPartial(Map<RedisURI, InetSocketAddress> slaves) {
         List<CompletableFuture<Void>> futures = new ArrayList<>();
         for (Entry<RedisURI, InetSocketAddress> entry : slaves.entrySet()) {
             CompletableFuture<Void> promise = new CompletableFuture<>();
@@ -196,5 +229,4 @@ public class DNSMonitor {
         }
         return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
     }
-
 }
